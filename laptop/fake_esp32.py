@@ -62,6 +62,20 @@ LINK_TIMEOUT_S = 5.0
 REOPEN_MAX_S = 20.0
 TICK_S = 0.1
 
+# --- elevation (top servo): mirrors firmware/solar_tracker/solar_tracker.ino's
+#     TRACK_ELEVATION_DEG/STOW_ELEVATION_DEG fallback + clamp behavior, for
+#     protocol-level testing. Unlike azimuth, this is NOT part of the frozen
+#     telemetry -- it exists here only so authority-hierarchy tests (SAFE
+#     overrides a commanded elevation, etc.) can inspect tracker.elev_angle
+#     directly. The simulator has no physical servo to calibrate against, so
+#     (unlike the firmware's solarElevationToServoTarget()) it applies the
+#     commanded elevation directly, clamped to ELEVATION_MIN/MAX_DEG -- no
+#     offset/inversion mapping, since there's no real actuator here to need one.
+ELEVATION_MIN_DEG, ELEVATION_MAX_DEG = 0.0, 70.0
+TRACK_ELEVATION_DEG = 45.0
+STOW_ELEVATION_DEG = 0.0
+RATE_ELEVATION = 20.0
+
 # --- simulated sun: slowly sweeps back and forth so the dashboard graph
 #     visibly shows balance falling and recovering without any manual input ---
 SUN_PERIOD_S = 45.0
@@ -107,9 +121,12 @@ class SimTracker:
         self.dark = False
         self.err = 0.0
         self.L = self.R = BASE_SUM_MV / 2
+        self.commanded_elevation: float | None = None
+        self.elev_angle = STOW_ELEVATION_DEG if self.latched else TRACK_ELEVATION_DEG
         self._lock = threading.Lock()
 
-    def apply_command(self, verdict: str, mode: str, hold: float) -> None:
+    def apply_command(self, verdict: str, mode: str, hold: float,
+                       elevation: float | None = None) -> None:
         with self._lock:
             if verdict == "SAFE":
                 self._set_latch(True)
@@ -118,6 +135,7 @@ class SimTracker:
             # UNKNOWN: latch untouched — this is the whole point of the latch.
             self.mode = mode
             self.hold_deg = max(ANGLE_MIN, min(ANGLE_MAX, hold))
+            self.commanded_elevation = elevation
             self.last_cmd_time = time.monotonic()
 
     def _set_latch(self, value: bool) -> None:
@@ -210,6 +228,20 @@ class SimTracker:
             delta = max(-max_step, min(max_step, self.target - self.angle))
             self.angle += delta
             self.settled_ticks = 0 if self.moving else self.settled_ticks + 1
+
+            # 4) elevation (top servo) — STOW always wins, same authority
+            #    order as azimuth above; otherwise use the last commanded
+            #    solar elevation if we have one, else the fixed fallback.
+            if self.state == "STW":
+                elev_target = STOW_ELEVATION_DEG
+            elif self.commanded_elevation is not None:
+                elev_target = self.commanded_elevation
+            else:
+                elev_target = TRACK_ELEVATION_DEG
+            elev_target = max(ELEVATION_MIN_DEG, min(ELEVATION_MAX_DEG, elev_target))
+            elev_max_step = RATE_ELEVATION * TICK_S
+            elev_delta = max(-elev_max_step, min(elev_max_step, elev_target - self.elev_angle))
+            self.elev_angle += elev_delta
 
             ms = int((now - self.boot_time) * 1000)
             at_limit = self.angle <= ANGLE_MIN + 0.1 or self.angle >= ANGLE_MAX - 0.1

@@ -16,9 +16,15 @@
 
   IMPORTANT — physical limitation of 2 LDRs (do not "fix" this, it's real):
     L and R give exactly ONE scalar light-balance error. That error drives
-    azimuth (the base) only. Elevation has no optical feedback at all in this
-    hardware; it is held at a fixed configurable TRACK_ELEVATION_DEG. See
-    "KNOWN LIMITATIONS" at the bottom of this file.
+    azimuth (the base) only. Elevation has NO optical feedback in this
+    hardware at all — it uses a calculated solar elevation target (date,
+    time, latitude, longitude — computed on the Python side by
+    laptop/solar_position.py, sent over the existing serial link as an
+    OPTIONAL 5th command field) when one has been sent, and falls back to a
+    fixed configurable TRACK_ELEVATION_DEG when it hasn't. Accurate
+    terminology: "two-axis actuation with two-LDR azimuth feedback and
+    predictive solar-elevation positioning" — NOT independent two-axis LDR
+    sensing. See "KNOWN LIMITATIONS" at the bottom of this file.
 
   IMPORTANT — base servo type is UNKNOWN from this repository:
     Nothing in solar-tracker documents whether the "360° servo" driving the
@@ -83,9 +89,26 @@ const int ELEVATION_SERVO_MIN_US = 500;   // CALIBRATE ON REAL HARDWARE
 const int ELEVATION_SERVO_MAX_US = 2500;  // CALIBRATE ON REAL HARDWARE
 const float ELEVATION_MIN_DEG = 0.0f;      // CALIBRATE — flattest physical position
 const float ELEVATION_MAX_DEG = 70.0f;     // CALIBRATE — steepest physical position
-const float TRACK_ELEVATION_DEG = 45.0f;   // CALIBRATE — fixed elevation used whenever not stowed
+const float TRACK_ELEVATION_DEG = 45.0f;   // CALIBRATE — fallback elevation, used only when
+                                             // Python hasn't sent a calculated solar elevation
 const float STOW_ELEVATION_DEG = 0.0f;     // CALIBRATE — flat, low-wind-exposure stow position
 const float RATE_ELEVATION_DEG_S = 20.0f;  // CALIBRATE — max elevation slew rate; avoids mechanical shock
+
+// ---- Solar elevation -> servo target mapping ------------------------------
+// Astronomical solar elevation and servo angle are NOT the same number — the
+// mechanical linkage can have an offset and/or be inverted relative to solar
+// elevation. solarElevationToServoTarget() (below) is the ONLY place this
+// mapping happens; nothing else touches these constants.
+const float SOLAR_ELEVATION_MIN = 0.0f;    // CALIBRATE — solar elevations at/below this clamp to
+                                             // ELEVATION_MIN_DEG. Also IS the night/below-horizon
+                                             // handling: night naturally clamps here, parking the
+                                             // panel at its configured minimum — no separate NIGHT
+                                             // state needed (see KNOWN LIMITATIONS).
+const float SOLAR_ELEVATION_MAX = 90.0f;   // CALIBRATE — solar elevations at/above this clamp to
+                                             // ELEVATION_MAX_DEG
+const float ELEVATION_OFFSET_DEG = 0.0f;   // CALIBRATE — constant mechanical offset added after mapping
+const bool ELEVATION_INVERTED = false;     // CALIBRATE — true if higher solar elevation should
+                                             // command a LOWER servo angle (mount-dependent)
 
 // ---- LDR tracking control (ported from laptop/fake_esp32.py SimTracker) --
 // Starting values are exactly what fake_esp32.py already uses. Treat them as
@@ -137,6 +160,14 @@ Mode mode = MODE_AUTO;
 TrackerState state = ST_TRK;
 float holdDegRequested = 0.0f;
 
+// Calculated solar elevation, as sent by Python (optional 5th command
+// field). hasCommandedElevation distinguishes "never received one" / "link
+// never sent this field" from a legitimate 0.0-degree value — a plain
+// float sentinel can't do that safely. Persists across a link hiccup, same
+// as holdDegRequested already does (see updateSafetyState()).
+bool hasCommandedElevation = false;
+float commandedElevationDeg = 0.0f;
+
 // Base (azimuth) axis. In BASE_CONTINUOUS mode this is a dead-reckoned
 // estimate, not a measured position — see KNOWN LIMITATIONS.
 float baseAngle = 0.0f;
@@ -170,6 +201,22 @@ int angleToMicroseconds(float angleDeg, float angleMin, float angleMax, int usMi
   float t = (angleDeg - angleMin) / (angleMax - angleMin);
   t = constrain(t, 0.0f, 1.0f);
   return usMin + (int)(t * (usMax - usMin));
+}
+
+// Astronomical solar elevation (from Python, degrees) -> elevation-servo
+// target (degrees, in the same ELEVATION_MIN/MAX_DEG space as everything
+// else in this file). The ONLY place solar-elevation calibration happens —
+// clamp to the usable solar range, map linearly onto the physical range,
+// apply mount inversion/offset, clamp again defensively. A solar elevation
+// at/below SOLAR_ELEVATION_MIN (including any negative, below-horizon
+// value) clamps to ELEVATION_MIN_DEG — this doubles as night/park handling,
+// see the file header.
+float solarElevationToServoTarget(float solarElevationDeg) {
+  float clamped = constrain(solarElevationDeg, SOLAR_ELEVATION_MIN, SOLAR_ELEVATION_MAX);
+  float t = (clamped - SOLAR_ELEVATION_MIN) / (SOLAR_ELEVATION_MAX - SOLAR_ELEVATION_MIN);
+  if (ELEVATION_INVERTED) t = 1.0f - t;
+  float mapped = ELEVATION_MIN_DEG + t * (ELEVATION_MAX_DEG - ELEVATION_MIN_DEG) + ELEVATION_OFFSET_DEG;
+  return constrain(mapped, ELEVATION_MIN_DEG, ELEVATION_MAX_DEG);
 }
 
 void stopBaseServo() {
@@ -356,9 +403,21 @@ void updateStateMachine(unsigned long now) {
 
   settledTicks = moving ? 0 : settledTicks + 1;
 
-  // 3) elevation target — independent of LDR error (see KNOWN LIMITATIONS):
-  // flat/low in STW, fixed TRACK_ELEVATION_DEG in every other state.
-  float elevTarget = (state == ST_STW) ? STOW_ELEVATION_DEG : TRACK_ELEVATION_DEG;
+  // 3) elevation target — independent of LDR error (see KNOWN LIMITATIONS).
+  // STOW always wins, exactly like the base axis above: a commanded solar
+  // elevation must NEVER move the top servo away from stow while latched.
+  // Otherwise, use the last calculated solar elevation if Python has sent
+  // one (mapped/clamped through solarElevationToServoTarget()); if it
+  // hasn't, fall back to the fixed TRACK_ELEVATION_DEG set-point exactly as
+  // before this feature existed.
+  float elevTarget;
+  if (state == ST_STW) {
+    elevTarget = STOW_ELEVATION_DEG;
+  } else if (hasCommandedElevation) {
+    elevTarget = solarElevationToServoTarget(commandedElevationDeg);
+  } else {
+    elevTarget = TRACK_ELEVATION_DEG;
+  }
   elevTarget = constrain(elevTarget, ELEVATION_MIN_DEG, ELEVATION_MAX_DEG);
   float elevMaxStep = RATE_ELEVATION_DEG_S * (SENSOR_INTERVAL_MS / 1000.0f);
   float elevDelta = constrain(elevTarget - elevAngle, -elevMaxStep, elevMaxStep);
@@ -422,19 +481,21 @@ void updateSafetyState() {
   }
 }
 
-// Parses and applies one "C,<verdict>,<mode>,<hold>" line. All-or-nothing,
-// matching laptop/link.py's parse_command() exactly (including rejecting a
-// line with more than 4 comma-separated fields). Malformed lines are
-// silently ignored, same as fake_esp32.py.
+// Parses and applies one "C,<verdict>,<mode>,<hold>[,<elevation>]" line.
+// All-or-nothing, matching laptop/link.py's parse_command() exactly:
+// accepts exactly 4 fields (no elevation) or exactly 5 (with a calculated
+// solar elevation target); anything else is rejected, same as before this
+// field existed. Malformed lines are silently ignored, same as
+// fake_esp32.py.
 void processCommandLine(char* line) {
-  char* fields[4];
+  char* fields[5];
   int n = 0;
   char* tok = strtok(line, ",");
-  while (tok != NULL && n < 4) {
+  while (tok != NULL && n < 5) {
     fields[n++] = tok;
     tok = strtok(NULL, ",");
   }
-  if (n != 4 || tok != NULL || strcmp(fields[0], "C") != 0) return;
+  if ((n != 4 && n != 5) || tok != NULL || strcmp(fields[0], "C") != 0) return;
 
   const char* verdict = fields[1];
   const char* modeStr = fields[2];
@@ -446,6 +507,14 @@ void processCommandLine(char* line) {
   float hold = strtof(fields[3], &endptr);
   if (endptr == fields[3]) return;  // not a valid float
 
+  bool haveElevation = (n == 5);
+  float elevation = 0.0f;
+  if (haveElevation) {
+    char* elevEndptr;
+    elevation = strtof(fields[4], &elevEndptr);
+    if (elevEndptr == fields[4]) return;  // not a valid float
+  }
+
   // All fields valid — apply atomically.
   if (!strcmp(verdict, "SAFE")) setSafetyLatch(true);
   else if (!strcmp(verdict, "OK")) setSafetyLatch(false);
@@ -453,6 +522,16 @@ void processCommandLine(char* line) {
 
   mode = !strcmp(modeStr, "HOLD") ? MODE_HOLD : MODE_AUTO;
   holdDegRequested = constrain(hold, BASE_ANGLE_MIN_DEG, BASE_ANGLE_MAX_DEG);
+
+  // The 5th field is re-evaluated on every command, not sticky: a command
+  // that omits it (old 4-field form, or a new sender explicitly clearing
+  // it via Link.set_elevation(None)) reverts to TRACK_ELEVATION_DEG
+  // immediately. "Absent -> fallback" stays true at every moment, not just
+  // "true until the first 5-field command ever arrives" — no stale
+  // elevation target can linger after the sender stops providing one.
+  hasCommandedElevation = haveElevation;
+  commandedElevationDeg = haveElevation ? elevation : 0.0f;
+
   lastCommandMs = millis();
 }
 
@@ -527,10 +606,22 @@ void loop() {
 // KNOWN LIMITATIONS (read before the demo)
 // ============================================================================
 // 1. Two LDRs give exactly ONE optical error dimension (light-left-vs-right).
-//    That drives azimuth (the base) only. There is no elevation sensing at
-//    all — elevation is an open-loop fixed set-point (TRACK_ELEVATION_DEG),
-//    not "two-axis LDR tracking." Do not describe this as independent
-//    dual-axis optical sensing.
+//    That drives azimuth (the base) only — always, unconditionally; nothing
+//    about the elevation feature changes this. Elevation has NO optical
+//    sensing of any kind: it is either a calculated solar-position target
+//    (commanded open-loop over serial, no feedback) or, absent that, a
+//    fixed set-point (TRACK_ELEVATION_DEG). Do not describe this as
+//    independent dual-axis optical sensing, and do not describe the
+//    calculated elevation as "measured" — it is commanded/open-loop,
+//    exactly like azimuth already is (see limitation 2 below), just from a
+//    different source (solar geometry instead of light-balance error).
+// 1b. Night / sun below the horizon is handled entirely by clamping in
+//    solarElevationToServoTarget(): any commanded solar elevation at or
+//    below SOLAR_ELEVATION_MIN (including negative, below-horizon values)
+//    clamps to ELEVATION_MIN_DEG — the configured "parked" position. No
+//    separate NIGHT state exists; this is a deliberately simple strategy,
+//    not an oversight. It relies on ELEVATION_MIN_DEG being calibrated to a
+//    genuinely safe/low position on the real hardware.
 // 2. If BASE_SERVO_MODE is BASE_CONTINUOUS (the default guess), baseAngle is
 //    a DEAD-RECKONED SOFTWARE ESTIMATE, not a measured position — there is
 //    no feedback sensor on a continuous-rotation servo. It can drift from
@@ -544,9 +635,16 @@ void loop() {
 // 4. The frozen telemetry protocol carries one angle/target pair. It is
 //    mapped to the BASE/azimuth axis, since that's what the 2-LDR error
 //    actually drives. Elevation position is not telemetered at all — the
-//    Python backend has no visibility into it. This is intentional
-//    backward-compatibility, not an oversight: adding an elevation field
-//    would require changing the frozen protocol.
+//    Python backend has no visibility into what the firmware actually did
+//    with the elevation target it sent (only what it commanded). This is
+//    intentional backward-compatibility, not an oversight: adding an
+//    elevation field would require changing the frozen protocol.
+// 4b. hasCommandedElevation/commandedElevationDeg are NOT persisted across a
+//    reboot (unlike the SAFE latch) and are re-evaluated fresh on every
+//    received command — a 4-field command reverts to TRACK_ELEVATION_DEG
+//    immediately, even mid-session. There is no staleness timeout beyond
+//    that: if the link drops entirely, the last commanded elevation (or the
+//    fallback) simply persists until a new command arrives.
 // 5. FLAG_MOVING reflects base-axis LDR correction only, matching its
 //    original single-axis meaning. Elevation motion between TRACK_ELEVATION
 //    and STOW_ELEVATION does not set this flag.

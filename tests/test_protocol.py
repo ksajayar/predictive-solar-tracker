@@ -126,20 +126,29 @@ def test_format_boot_round_trip():
 # ---- command: parse_command / format_command ----
 
 def test_parse_command_valid():
-    assert parse_command("C,OK,AUTO,0") == ("OK", "AUTO", 0.0)
-    assert parse_command("C,SAFE,AUTO,0") == ("SAFE", "AUTO", 0.0)
-    assert parse_command("C,UNKNOWN,AUTO,0") == ("UNKNOWN", "AUTO", 0.0)
-    assert parse_command("C,OK,HOLD,20") == ("OK", "HOLD", 20.0)
-    assert parse_command("C,OK,HOLD,-15.5") == ("OK", "HOLD", -15.5)
+    # 4-field form (no elevation target): elevation parses as None.
+    assert parse_command("C,OK,AUTO,0") == ("OK", "AUTO", 0.0, None)
+    assert parse_command("C,SAFE,AUTO,0") == ("SAFE", "AUTO", 0.0, None)
+    assert parse_command("C,UNKNOWN,AUTO,0") == ("UNKNOWN", "AUTO", 0.0, None)
+    assert parse_command("C,OK,HOLD,20") == ("OK", "HOLD", 20.0, None)
+    assert parse_command("C,OK,HOLD,-15.5") == ("OK", "HOLD", -15.5, None)
+
+
+def test_parse_command_valid_with_elevation():
+    # 5-field form (calculated solar elevation target).
+    assert parse_command("C,OK,AUTO,0,57.4") == ("OK", "AUTO", 0.0, 57.4)
+    assert parse_command("C,OK,AUTO,0,-10.0") == ("OK", "AUTO", 0.0, -10.0)  # sun below horizon
+    assert parse_command("C,SAFE,AUTO,0,57.4") == ("SAFE", "AUTO", 0.0, 57.4)  # still parses -- SAFE authority is the firmware's job, not the parser's
 
 
 @pytest.mark.parametrize("line", [
-    "C,BANANA,AUTO,0",     # unknown verdict
-    "C,OK,SIDEWAYS,0",     # unknown mode
-    "C,OK,AUTO,notanumber",  # unparseable hold angle
-    "C,OK,AUTO",           # too few fields
-    "C,OK,AUTO,0,extra",   # too many fields
-    "T,1,TRK,1,1,1,1,1,1",  # wrong prefix (a telemetry line)
+    "C,BANANA,AUTO,0",           # unknown verdict
+    "C,OK,SIDEWAYS,0",           # unknown mode
+    "C,OK,AUTO,notanumber",      # unparseable hold angle
+    "C,OK,AUTO",                 # too few fields
+    "C,OK,AUTO,0,notanumber",    # unparseable elevation
+    "C,OK,AUTO,0,57.4,extra",    # too many fields (6)
+    "T,1,TRK,1,1,1,1,1,1",       # wrong prefix (a telemetry line)
     "",
     "garbage",
 ])
@@ -149,7 +158,14 @@ def test_parse_command_invalid(line):
 
 def test_command_round_trip():
     line = format_command("SAFE", "HOLD", 12.5)
-    assert parse_command(line) == ("SAFE", "HOLD", 12.5)
+    assert line == "C,SAFE,HOLD,12.5"  # old 4-field form, byte-for-byte unchanged
+    assert parse_command(line) == ("SAFE", "HOLD", 12.5, None)
+
+
+def test_command_round_trip_with_elevation():
+    line = format_command("OK", "AUTO", 0.0, elevation=57.4)
+    assert line == "C,OK,AUTO,0.0,57.4"
+    assert parse_command(line) == ("OK", "AUTO", 0.0, 57.4)
 
 
 def test_format_command_rejects_invalid_values():

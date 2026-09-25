@@ -12,19 +12,47 @@ Run:
 """
 from __future__ import annotations
 
+import os
+import threading
+import time
+from datetime import datetime
+
 import streamlit as st
 from plotly.subplots import make_subplots
 
 from link import Link, FLAG_DARK, FLAG_LIMIT
-from weather import WeatherService, SCENARIOS, DEFAULT_CFG
+from solar_position import calculate_solar_elevation
+from weather import WeatherService, SCENARIOS, DEFAULT_CFG, DEFAULT_LAT, DEFAULT_LON
 
 # Keep in sync with the tracker's own E_START (fake_esp32.py / real firmware).
 # Only used here to label the graph's deadband and the "CENTERED" cutoff.
 E_START_DISPLAY = 0.06
 
+# How often to recompute the solar elevation target and push it to the
+# ESP32 (laptop/solar_position.py, optional 5th command field -- see
+# link.py). Solar elevation moves slowly (well under 1 deg/min except right
+# around solar noon at low latitudes), so this is deliberately not fast;
+# it's cheap pure math, so there's no real cost to going faster either.
+SOLAR_ELEVATION_INTERVAL_S = 30.0
+
 STATE_LABEL = {"TRK": "TRACKING", "STW": "SAFE MODE", "RPN": "REOPENING", "HLD": "HOLD"}
 
 st.set_page_config(page_title="Solar Tracker", page_icon="☀️", layout="wide")
+
+
+def _solar_elevation_loop(link: Link, lat: float, lon: float) -> None:
+    """Recomputes the calculated solar elevation target on a timer and
+    pushes it into `link` (which sends it as the optional 5th command
+    field — see link.py / solar_position.py). Reuses TRACKER_LAT/TRACKER_LON,
+    the same env vars WeatherService already reads, so location is
+    configured in exactly one place for both weather and solar elevation."""
+    while True:
+        try:
+            elevation = calculate_solar_elevation(lat, lon, datetime.now().astimezone())
+            link.set_elevation(elevation)
+        except Exception:
+            pass  # never let a transient clock/tz issue kill this thread
+        time.sleep(SOLAR_ELEVATION_INTERVAL_S)
 
 
 @st.cache_resource
@@ -33,6 +61,12 @@ def services():
     never on a script rerun — this is what makes reconnection automatic."""
     link = Link().start()
     wx = WeatherService(link).start()
+
+    lat = float(os.environ.get("TRACKER_LAT", DEFAULT_LAT))
+    lon = float(os.environ.get("TRACKER_LON", DEFAULT_LON))
+    threading.Thread(target=_solar_elevation_loop, args=(link, lat, lon),
+                      daemon=True, name="solar-elevation").start()
+
     return link, wx
 
 
@@ -186,13 +220,20 @@ def live_view():
 
     with c2:
         st.subheader("\U0001f3af Panel")
-        st.metric("Commanded angle", f"{t['angle']:+.1f}°")
-        st.caption("Commanded, not measured — this servo has no position feedback.")
+        st.metric("Azimuth (base servo)", f"{t['angle']:+.1f}°")
+        st.caption("Commanded, not measured — this servo has no position feedback. "
+                   "Driven by the 2-LDR error above.")
         st.write(f"Target **{t['target']:+.1f}°**  ·  State **{STATE_LABEL[t['state']]}**"
                  + ("  · at limit" if t["flags"] & FLAG_LIMIT else ""))
         lc = last_correction(link_snap["history"])
         if lc:
             st.caption(f"Last correction: {lc[0]:.1f}s, {lc[1]:+.0f}°")
+        elevation_sent = link_snap["cmd"][3] if len(link_snap["cmd"]) > 3 else None
+        if elevation_sent is not None:
+            st.write(f"Elevation target **{elevation_sent:+.1f}°**")
+            st.caption("CALCULATED from date/time/location (laptop/solar_position.py) — "
+                       "not optically sensed, and not measured on the ESP32 either "
+                       "(open-loop, same as azimuth).")
 
     with c3:
         wx = wx_snap["wx"]
@@ -214,7 +255,8 @@ def live_view():
         st.plotly_chart(fig, use_container_width=True, key="trend")
 
     with st.expander("Diagnostics"):
-        st.write(f"Sent to ESP32: `C,{','.join(str(x) for x in link_snap['cmd'])}`")
+        cmd_fields = [x for x in link_snap["cmd"] if x is not None]  # drop the unset elevation slot
+        st.write(f"Sent to ESP32: `C,{','.join(str(x) for x in cmd_fields)}`")
         st.write(f"Bad/malformed lines: {link_snap['bad_lines']}  ·  "
                  f"ESP32 boots/reboots seen: {link_snap['boots']}")
         st.write(f"Telemetry log: `{link_snap['log_path']}`")

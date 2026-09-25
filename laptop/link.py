@@ -22,10 +22,16 @@ Protocol (frozen — see CLAUDE.md before changing it):
       B,tracker,v1,reset=<n>,latch=<0|1>      (sent once, at boot)
 
   laptop -> ESP32, 1 Hz heartbeat + immediately on change:
-      C,<verdict>,<mode>,<hold_angle>
+      C,<verdict>,<mode>,<hold_angle>[,<elevation_target>]
       e.g. C,OK,AUTO,0   C,SAFE,AUTO,0   C,UNKNOWN,AUTO,0   C,OK,HOLD,20
+           C,OK,AUTO,0,57.4   (calculated solar elevation, degrees)
       verdict: OK | SAFE | UNKNOWN
       mode:    AUTO | HOLD
+      elevation_target: OPTIONAL 5th field, added for calculated solar
+        elevation (see laptop/solar_position.py). Omitting it is still
+        valid -- older firmware/tooling that only knows the 4-field form
+        keeps working unmodified; a device that understands the 5th field
+        falls back to its own fixed elevation set-point when it's absent.
 
 Transport:
   TRACKER_TRANSPORT=sim (default)   -> connect to the fake_esp32.py TCP server
@@ -131,9 +137,15 @@ def format_boot(reset: int = 0, latch: bool = False) -> str:
 
 
 def parse_command(line: str) -> Optional[tuple]:
-    """Parse a 'C,<verdict>,<mode>,<hold>' line -> (verdict, mode, hold_deg) or None."""
+    """Parse a 'C,<verdict>,<mode>,<hold>[,<elevation>]' line ->
+    (verdict, mode, hold_deg, elevation_deg_or_None), or None if malformed.
+
+    Accepts exactly 4 fields (old form, elevation=None) or exactly 5 fields
+    (new form, with a calculated solar elevation target) -- anything else
+    (3 fields, 6 fields, ...) is rejected, same as before this field existed.
+    """
     fields = line.strip().split(",")
-    if len(fields) != 4 or fields[0] != "C":
+    if len(fields) not in (4, 5) or fields[0] != "C":
         return None
     verdict, mode, hold_s = fields[1], fields[2], fields[3]
     if verdict not in VERDICTS or mode not in MODES:
@@ -142,15 +154,28 @@ def parse_command(line: str) -> Optional[tuple]:
         hold = float(hold_s)
     except ValueError:
         return None
-    return (verdict, mode, hold)
+    elevation = None
+    if len(fields) == 5:
+        try:
+            elevation = float(fields[4])
+        except ValueError:
+            return None
+    return (verdict, mode, hold, elevation)
 
 
-def format_command(verdict: str, mode: str, hold: float = 0.0) -> str:
+def format_command(verdict: str, mode: str, hold: float = 0.0,
+                    elevation: Optional[float] = None) -> str:
+    """`elevation=None` (the default) emits the old 4-field line, unchanged
+    byte-for-byte from before this field existed -- a receiver that has
+    never heard of elevation targets sees exactly what it always has."""
     if verdict not in VERDICTS:
         raise ValueError(f"unknown verdict: {verdict!r}")
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode!r}")
-    return f"C,{verdict},{mode},{float(hold):.1f}"
+    line = f"C,{verdict},{mode},{float(hold):.1f}"
+    if elevation is not None:
+        line += f",{float(elevation):.1f}"
+    return line
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +210,11 @@ class Link:
         self._last_ms: Optional[int] = None
 
         # Safe default: never claim OK until weather.py explicitly decides.
-        self._cmd = ["UNKNOWN", "AUTO", 0.0]
+        # 4th slot (elevation) defaults to None: no calculated solar
+        # elevation known yet -> format_command() omits the 5th wire field
+        # entirely, so an ESP32 falls back to its own fixed set-point,
+        # exactly as if talking to code from before this field existed.
+        self._cmd = ["UNKNOWN", "AUTO", 0.0, None]
         self._dirty = True
         self._last_tx = 0.0
         self._ser = None
@@ -228,6 +257,11 @@ class Link:
             raise ValueError(f"unknown mode: {mode!r}")
         self._set(1, mode)
         self._set(2, float(hold))
+
+    def set_elevation(self, elevation: Optional[float]) -> None:
+        """Calculated solar elevation target, degrees, or None to omit the
+        field entirely (falls back to the device's own fixed set-point)."""
+        self._set(3, None if elevation is None else float(elevation))
 
     def _set(self, idx: int, value) -> None:
         with self._lock:
@@ -322,10 +356,10 @@ class Link:
 
     def _send(self) -> None:
         with self._lock:
-            verdict, mode, hold = self._cmd
+            verdict, mode, hold, elevation = self._cmd
             self._dirty = False
         try:
-            line = format_command(verdict, mode, hold)
+            line = format_command(verdict, mode, hold, elevation)
             self._ser.write((line + "\n").encode("ascii"))
             self._last_tx = time.time()
         except Exception as exc:

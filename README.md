@@ -3,50 +3,75 @@
 Weather-aware solar-tracker prototype:
 
 ```
-Weather API (Open-Meteo)
-        |
-        v
-Python edge controller   (laptop/, this repo's "backend")
-        |
-    USB serial            (frozen protocol — see below)
-        |
-        v
-     ESP32-S3
-        |
-  +-----+-----+
-  |           |
-2 LDRs     2 servos
-              |
-        +-----+-----+
-     base (azimuth)  top (elevation)
+                    time + location (TRACKER_LAT/TRACKER_LON)
+                                 |
+                                 v
+                     laptop/solar_position.py
+                        (calculated elevation)
+                                 |
+Weather API (Open-Meteo) ---+    |
+                             v   v
+                     Python edge controller   (laptop/, this repo's "backend")
+                                 |
+                             USB serial          (frozen protocol — see below)
+                                 |
+                                 v
+                              ESP32-S3
+                                 |
+                       +---------+---------+
+                       |                   |
+                    2 LDRs             elevation target
+                       |                   |
+                       v                   v
+                AZIMUTH CONTROL       TOP SERVO
+                       |
+                       v
+                  BASE SERVO
 ```
 
 The 2 LDRs give exactly **one** optical light-balance measurement, and that
-one error drives the **base servo (azimuth)** tracking. The **top servo
-(elevation)** has no optical feedback of its own — it holds a fixed,
-configurable elevation set-point (flat/stowed vs. a tracking angle), swapped
-out later for something smarter (calculated solar position, a time-based
-curve, or a weather/backend command) without touching the azimuth tracker.
-This is **not** independent dual-axis optical sensing — don't describe it
-that way.
+one error drives the **base servo (azimuth)** tracking — real-time, closed
+around the LDR reading. The **top servo (elevation)** has no optical
+feedback of its own: its target is *calculated* from date, time, and the
+configured latitude/longitude (`laptop/solar_position.py`, NOAA solar
+position algorithm), sent over the same serial link as an optional field,
+and falls back to a fixed set-point if Python hasn't sent one yet. Accurate
+terminology: **"two-LDR azimuth feedback with calculated solar-elevation
+positioning."** This is **not** independent dual-axis optical sensing —
+don't describe it that way, and don't describe the elevation target as
+"measured" — it's commanded/open-loop, same as azimuth already is, just
+computed instead of light-driven.
 
-Weather/safety verdicts from the Python side always override LDR tracking:
-a `SAFE` verdict stops tracking and drives to stow immediately, regardless of
-what the LDRs are reporting.
+Weather/safety verdicts from the Python side always override BOTH tracking
+behaviours: a `SAFE` verdict stops azimuth tracking and drives elevation to
+stow immediately, regardless of what the LDRs are reporting or what solar
+elevation was last calculated.
 
-This repo has two ESP32-side implementations:
-- [`laptop/fake_esp32.py`](laptop/fake_esp32.py) — the development simulator
-  (Python, runs on your laptop, no hardware needed). This is what the rest of
-  this README's "Run it" instructions use.
+This repo has two ESP32-side implementations. **Real hardware is the
+primary system** — `fake_esp32.py` is development/testing tooling, not a
+second production path:
 - [`firmware/solar_tracker/solar_tracker.ino`](firmware/solar_tracker/solar_tracker.ino)
   — the real ESP32-S3 C++ firmware, compiled against the `esp32:esp32:esp32s3`
-  Arduino core. See that file's header comment for hardware mapping,
-  calibration constants, and known limitations (base servo type
-  positional-vs-continuous is unconfirmed against real hardware and is a
-  configurable constant, not a guess baked into the logic).
+  Arduino core. **DEVELOPMENT/TESTING ONLY note doesn't apply here** — this
+  is what the physical tracker runs. See that file's header comment for
+  hardware mapping, calibration constants, and known limitations (base servo
+  type positional-vs-continuous is unconfirmed against real hardware and is
+  a configurable constant, not a guess baked into the logic).
+- [`laptop/fake_esp32.py`](laptop/fake_esp32.py) — **DEVELOPMENT / TESTING
+  ONLY.** A Python simulator, run as its own process, standing in for the
+  ESP32 so `app.py`/`link.py` can be developed and the protocol can be
+  exercised without hardware attached. Nothing in `tests/` currently imports
+  it directly (only `link.py`'s parse/format functions are unit-tested), but
+  it stays: it's the executable reference the firmware was ported from, the
+  fastest way to develop the dashboard without hardware, and the "Run it
+  (simulator)" instructions below still use it.
 
 Both talk the identical frozen wire protocol, so `laptop/link.py` and the
-Streamlit dashboard work unmodified against either one.
+Streamlit dashboard work unmodified against either one — switching between
+them is one environment variable (`TRACKER_TRANSPORT`, see below), never a
+silent runtime fallback. If the real ESP32 disconnects, the dashboard shows
+"ESP32 DISCONNECTED"; it never substitutes simulator data to paper over a
+lost hardware link.
 
 **The laptop advises. The ESP32 controls.** See [CLAUDE.md](CLAUDE.md) for
 the full architecture, the frozen serial protocol, and the safety invariants.
@@ -59,14 +84,16 @@ solar-tracker/
 │   ├── app.py              Streamlit dashboard — display + operator input only
 │   ├── link.py              owns the transport; protocol parse/format + Link class
 │   ├── weather.py           Open-Meteo fetch, evaluate_rules(), WeatherService
-│   ├── fake_esp32.py        simulated ESP32 device (run as its own process)
+│   ├── solar_position.py    calculated solar elevation (pure, unit-tested)
+│   ├── fake_esp32.py        simulated ESP32 device — DEVELOPMENT/TESTING ONLY
 │   └── requirements.txt
 ├── firmware/
 │   └── solar_tracker/
 │       └── solar_tracker.ino   real ESP32-S3 firmware (2 LDRs, base+elevation servos)
 ├── tests/
-│   ├── test_protocol.py     wire-format parsing/formatting
-│   └── test_weather.py      evaluate_rules() safety properties
+│   ├── test_protocol.py       wire-format parsing/formatting
+│   ├── test_solar_position.py solar elevation calculation (deterministic)
+│   └── test_weather.py        evaluate_rules() safety properties
 ├── logs/                    telemetry CSVs + fake_esp32's persisted latch (gitignored)
 ├── CLAUDE.md                 architecture notes for Claude Code sessions in this repo
 └── README.md
@@ -138,10 +165,12 @@ source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-57 tests, covering the wire protocol (valid/invalid/malformed/garbage
-packets, round-trips) and the weather decision engine (each scenario's
-verdict, the "missing data never clears SAFE" property, hysteresis, the
-clearing dwell, and pre-emptive forecast-gust SAFE).
+69 tests, covering the wire protocol (valid/invalid/malformed/garbage
+packets, round-trips, old/new command backward compatibility), the
+calculated solar elevation (sunrise/midday/sunset/night, date/latitude
+sensitivity, determinism, tz-aware input), and the weather decision engine
+(each scenario's verdict, the "missing data never clears SAFE" property,
+hysteresis, the clearing dwell, and pre-emptive forecast-gust SAFE).
 
 ## Simulator ↔ real ESP32
 
@@ -153,7 +182,7 @@ Everything goes through one environment variable. Nothing in `app.py`,
 | `TRACKER_TRANSPORT` | `sim` | `sim` connects to `fake_esp32.py`. `serial` auto-detects a real ESP32 by USB VID (CP210x / CH340 / FTDI / Espressif native USB). |
 | `TRACKER_PORT` | unset | Overrides discovery entirely. A device path (`/dev/cu.usbserial-XXXX` on macOS, `COM5` on Windows) for real hardware, or a full `socket://host:port` URL. |
 | `FAKE_ESP32_HOST` / `FAKE_ESP32_PORT` | `127.0.0.1` / `9091` | Where `link.py` looks for the simulator when `TRACKER_TRANSPORT=sim`. Must match what you passed to `fake_esp32.py`. |
-| `TRACKER_LAT` / `TRACKER_LON` | `0.0` / `0.0` (placeholder — the middle of the ocean, on purpose) | Set these to the venue's coordinates before the demo, or LIVE weather will be meaningless. |
+| `TRACKER_LAT` / `TRACKER_LON` | `0.0` / `0.0` (placeholder — the middle of the ocean, on purpose) | Set these to the venue's coordinates before the demo. Used for BOTH the Open-Meteo weather fetch AND the calculated solar elevation (`laptop/solar_position.py`) — one place configures both, deliberately. Left unset, LIVE weather is meaningless AND the elevation target will be wrong for your location. |
 
 Hardware team, on demo day:
 
@@ -187,23 +216,54 @@ documented at the top of `laptop/link.py` and in [CLAUDE.md](CLAUDE.md):
 - Telemetry line format, field order, and the 4 state names (`TRK`/`STW`/`RPN`/`HLD`)
 - The flags bitmask (1/2/4/8)
 - The boot line format (`B,tracker,v1,reset=<n>,latch=<0|1>`)
-- Accepting `C,<OK|SAFE|UNKNOWN>,<AUTO|HOLD>,<hold_deg>` and treating `UNKNOWN`
-  as "leave the SAFE latch untouched"
+- Accepting `C,<OK|SAFE|UNKNOWN>,<AUTO|HOLD>,<hold_deg>[,<elevation_target>]`
+  and treating `UNKNOWN` as "leave the SAFE latch untouched"
 - ~10 Hz telemetry, and re-sending its own state promptly after a reboot
 
+The command's 5th field (calculated solar elevation, degrees) is **optional
+and fully backward compatible**:
+
+```
+OLD (still valid):  C,OK,AUTO,0.0
+NEW:                 C,OK,AUTO,0.0,57.4
+```
+
+A 4-field command means "no calculated elevation available this tick" — the
+firmware falls back to its fixed `TRACK_ELEVATION_DEG` set-point, exactly as
+if this feature didn't exist. A 5-field command carries the elevation target
+computed by `laptop/solar_position.py`. Either way, `SAFE` still overrides
+elevation to the stow position, unconditionally — a commanded elevation can
+never move the top servo away from stow while the safety latch is held.
+
 The telemetry `angle`/`target` fields carry the base/azimuth axis only — the
-one axis the 2 LDRs actually drive. The elevation servo has no wire
-representation; it's an ESP32-local fixed set-point, invisible to the Python
-side by design (adding it would mean changing the frozen protocol).
+one axis the 2 LDRs actually drive, and the only one with any kind of
+position estimate at all. The elevation servo has no wire representation in
+telemetry (deliberately, to avoid changing the frozen format) and no
+feedback sensor — its target is commanded open-loop, whether it came from
+the fixed fallback or from `solar_position.py`.
 
 `laptop/fake_esp32.py` is the executable reference this firmware was ported
-from, and remains the development simulator going forward — it's what the
-"Run it (simulator)" instructions above use, and it's still the fastest way
-to iterate on `app.py`/`weather.py` without hardware. When in doubt about
-exact framing or timing on either side, `link.py`'s parse/format functions
-are the single source of truth.
+from (including the elevation authority logic), and remains
+**development/testing tooling** — it's what the "Run it (simulator)"
+instructions above use, and it's still the fastest way to iterate on
+`app.py`/`weather.py` without hardware. It is NOT part of the hardware demo
+path. When in doubt about exact framing or timing on either side, `link.py`'s
+parse/format functions are the single source of truth.
 
 Compiled and verified against `esp32:esp32:esp32s3` (Arduino ESP32 core
 3.3.12, ESP32Servo 3.2.1) — see the header comment in `solar_tracker.ino` for
 the full pin/calibration map and known limitations before flashing real
 hardware.
+
+## Data provenance
+
+For the hardware demo, know where every number on the dashboard actually
+comes from:
+
+| Data | Source | Notes |
+|---|---|---|
+| Left/right LDR readings, azimuth tracking error | **REAL / MEASURED** | `analogReadMilliVolts()` on the physical ESP32-S3, when running real firmware |
+| ESP32 tracker state, azimuth angle/target | **REAL / MEASURED** (state) or **commanded/open-loop** (angle) | The state machine is real; the angle itself has no position feedback sensor — see `solar_tracker.ino`'s known limitations |
+| Elevation target | **CALCULATED** | `laptop/solar_position.py`, from date/time/latitude/longitude — never optically sensed |
+| Weather (wind, gusts, conditions) | **EXTERNAL** | Open-Meteo, or an operator-selected simulated scenario (clearly labeled "SIMULATED" in the UI when active) |
+| Everything from `fake_esp32.py` | **SIMULATED** | Development/testing only — never used for the real demo (see above) |
