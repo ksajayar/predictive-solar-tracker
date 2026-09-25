@@ -1,4 +1,5 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -9,3 +10,25 @@ logs/*.json
 
 .streamlit/
 .DS_Store
+
+# secrets
+.env
+.env.*
+
+# editors
+.vscode/
+.idea/
+
+# generic build output
+build/
+dist/
+
+# Arduino / ESP32 build artifacts (arduino-cli's own cache lives outside the
+# repo by default; these only matter if someone compiles with a local
+# --build-path). Never matches firmware/**/*.ino source files.
+firmware/**/build/
+*.hex
+*.bin
+*.elf
+*.map
+*.o

@@ -1,10 +1,52 @@
-# Solar Tracker — laptop / backend
+# Solar Tracker
 
-Weather-aware single-axis solar-tracker prototype. This is the laptop side:
-serial link, weather decision logic, and the Streamlit dashboard. It runs
-today against a simulated ESP32 (`fake_esp32.py`) so software work doesn't
-block on hardware, and switches to the real board later by changing one
-environment variable — see [Simulator ↔ real ESP32](#simulator--real-esp32).
+Weather-aware solar-tracker prototype:
+
+```
+Weather API (Open-Meteo)
+        |
+        v
+Python edge controller   (laptop/, this repo's "backend")
+        |
+    USB serial            (frozen protocol — see below)
+        |
+        v
+     ESP32-S3
+        |
+  +-----+-----+
+  |           |
+2 LDRs     2 servos
+              |
+        +-----+-----+
+     base (azimuth)  top (elevation)
+```
+
+The 2 LDRs give exactly **one** optical light-balance measurement, and that
+one error drives the **base servo (azimuth)** tracking. The **top servo
+(elevation)** has no optical feedback of its own — it holds a fixed,
+configurable elevation set-point (flat/stowed vs. a tracking angle), swapped
+out later for something smarter (calculated solar position, a time-based
+curve, or a weather/backend command) without touching the azimuth tracker.
+This is **not** independent dual-axis optical sensing — don't describe it
+that way.
+
+Weather/safety verdicts from the Python side always override LDR tracking:
+a `SAFE` verdict stops tracking and drives to stow immediately, regardless of
+what the LDRs are reporting.
+
+This repo has two ESP32-side implementations:
+- [`laptop/fake_esp32.py`](laptop/fake_esp32.py) — the development simulator
+  (Python, runs on your laptop, no hardware needed). This is what the rest of
+  this README's "Run it" instructions use.
+- [`firmware/solar_tracker/solar_tracker.ino`](firmware/solar_tracker/solar_tracker.ino)
+  — the real ESP32-S3 C++ firmware, compiled against the `esp32:esp32:esp32s3`
+  Arduino core. See that file's header comment for hardware mapping,
+  calibration constants, and known limitations (base servo type
+  positional-vs-continuous is unconfirmed against real hardware and is a
+  configurable constant, not a guess baked into the logic).
+
+Both talk the identical frozen wire protocol, so `laptop/link.py` and the
+Streamlit dashboard work unmodified against either one.
 
 **The laptop advises. The ESP32 controls.** See [CLAUDE.md](CLAUDE.md) for
 the full architecture, the frozen serial protocol, and the safety invariants.
@@ -19,6 +61,9 @@ solar-tracker/
 │   ├── weather.py           Open-Meteo fetch, evaluate_rules(), WeatherService
 │   ├── fake_esp32.py        simulated ESP32 device (run as its own process)
 │   └── requirements.txt
+├── firmware/
+│   └── solar_tracker/
+│       └── solar_tracker.ino   real ESP32-S3 firmware (2 LDRs, base+elevation servos)
 ├── tests/
 │   ├── test_protocol.py     wire-format parsing/formatting
 │   └── test_weather.py      evaluate_rules() safety properties
@@ -134,10 +179,10 @@ it's simply not used.
 | Streamlit shows stale numbers after `git pull` / editing `link.py` or `weather.py` | Fully restart `streamlit run app.py` (Ctrl-C, rerun). `@st.cache_resource` keeps the background threads alive across a hot-reload from `runOnSave`, which can pin you to stale module code — a full process restart is the reliable fix. |
 | `pip install` fails on `streamlit` | You're on system Python 3.9. Use Python 3.10+ (see Setup). |
 
-## What the hardware team must match exactly
+## What the real ESP32 firmware implements
 
-The real ESP32 firmware must implement the identical protocol documented at
-the top of `laptop/link.py` and in [CLAUDE.md](CLAUDE.md):
+`firmware/solar_tracker/solar_tracker.ino` implements the identical protocol
+documented at the top of `laptop/link.py` and in [CLAUDE.md](CLAUDE.md):
 
 - Telemetry line format, field order, and the 4 state names (`TRK`/`STW`/`RPN`/`HLD`)
 - The flags bitmask (1/2/4/8)
@@ -146,6 +191,19 @@ the top of `laptop/link.py` and in [CLAUDE.md](CLAUDE.md):
   as "leave the SAFE latch untouched"
 - ~10 Hz telemetry, and re-sending its own state promptly after a reboot
 
-`fake_esp32.py` (`laptop/fake_esp32.py`) is the executable reference for all
-of the above — when in doubt about exact framing or timing, that's the
-source of truth alongside `link.py`'s parse/format functions.
+The telemetry `angle`/`target` fields carry the base/azimuth axis only — the
+one axis the 2 LDRs actually drive. The elevation servo has no wire
+representation; it's an ESP32-local fixed set-point, invisible to the Python
+side by design (adding it would mean changing the frozen protocol).
+
+`laptop/fake_esp32.py` is the executable reference this firmware was ported
+from, and remains the development simulator going forward — it's what the
+"Run it (simulator)" instructions above use, and it's still the fastest way
+to iterate on `app.py`/`weather.py` without hardware. When in doubt about
+exact framing or timing on either side, `link.py`'s parse/format functions
+are the single source of truth.
+
+Compiled and verified against `esp32:esp32:esp32s3` (Arduino ESP32 core
+3.3.12, ESP32Servo 3.2.1) — see the header comment in `solar_tracker.ino` for
+the full pin/calibration map and known limitations before flashing real
+hardware.
