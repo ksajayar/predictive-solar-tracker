@@ -1,8 +1,10 @@
 # CLAUDE.md — project memory for this repo
 
-Weather-aware single-axis solar-tracker hackathon prototype. This file is
-context for any Claude Code session working in this repo. See README.md for
-setup/run instructions.
+Weather-aware solar-tracker hackathon prototype: 2 LDRs give exactly one
+optical error dimension (azimuth only), driving a base servo; a second, top
+servo handles elevation on a fixed configurable set-point, not LDR feedback.
+This file is context for any Claude Code session working in this repo. See
+README.md for setup/run instructions.
 
 ## Architecture (frozen — do not redesign without a genuine blocking flaw)
 
@@ -17,7 +19,7 @@ Simulated scenarios ──► evaluate_rules() ──► OK | SAFE | UNKNOWN ─
                                                      USB serial / socket (sim)
                                                                     ▼
                                                                   ESP32
-                                                  (2 LDRs, 1 servo, 1 tracking axis)
+                                        (2 LDRs, 2 servos: base azimuth + top elevation)
 ```
 
 **The laptop advises. The ESP32 controls.** The ESP32 (real or `fake_esp32.py`)
@@ -29,8 +31,10 @@ never per-tick servo commands.
 
 ## Hardware constraints (do not change)
 
-- Exactly 2 LDRs, exactly 1 servo, 1 physical tracking axis. No X/Y, no 4-LDR
-  sensor head, no second servo.
+- Exactly 2 LDRs, giving exactly one optical error dimension (azimuth only —
+  no independent elevation sensing). Exactly 2 servos: base (azimuth,
+  LDR-driven) + top (elevation, fixed configurable set-point, not
+  LDR-driven). No 4-LDR sensor head, no third servo, no stepper motor.
 - No real photovoltaic panel. No INA219, no voltage/current/power
   measurement, no MPPT, no energy/efficiency claims anywhere in the UI.
 - No ESP32 Wi-Fi — USB serial only (or the socket-based simulator transport
@@ -51,9 +55,12 @@ laptop -> ESP32, 1 Hz:    C,<OK|SAFE|UNKNOWN>,<AUTO|HOLD>,<hold_deg>
 ```
 
 Treat this as frozen. If you must change it, change it in exactly one place
-(`link.py`'s parse/format functions), update `fake_esp32.py` and
-`tests/test_protocol.py` together, and tell the hardware team — they hand-roll
-the same framing in C++ in the ESP32 firmware (not in this repo).
+(`link.py`'s parse/format functions), then update `fake_esp32.py`,
+`tests/test_protocol.py`, and `firmware/solar_tracker/solar_tracker.ino`
+together. The real firmware now lives in this repo, ported field-for-field
+from `fake_esp32.py`'s tracking state machine. Its `angle`/`target` telemetry
+fields carry the base/azimuth axis only — elevation has no wire
+representation, by design (see that file's header comment).
 
 ## The one safety property everything else depends on
 
@@ -105,6 +112,11 @@ outside of `link.py`'s `_resolve_port()`.
   fetch, simulated scenarios, `WeatherService` (background threads).
 - `laptop/app.py` — Streamlit UI. Display + operator input only; never
   touches the transport or runs decision logic itself.
+- `firmware/solar_tracker/solar_tracker.ino` — the real ESP32-S3 C++
+  firmware. Ported from `fake_esp32.py`'s tracking state machine; compiled
+  against `esp32:esp32:esp32s3` (Arduino ESP32 core). Base servo type
+  (continuous-rotation vs. positional) is unconfirmed against real hardware —
+  see the file's header comment and its `BASE_SERVO_MODE` constant.
 - `tests/` — `test_protocol.py` (wire format), `test_weather.py`
   (`evaluate_rules()` safety properties). Run with `pytest tests/`.
 
